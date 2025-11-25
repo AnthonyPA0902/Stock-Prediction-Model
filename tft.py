@@ -96,7 +96,6 @@ tft = TemporalFusionTransformer.from_dataset(
     #logging_metrics=["MAE"],
     reduce_on_plateau_patience=3,
 )
-#ref: https://pytorch-forecasting.readthedocs.io/en/v1.4.0/tutorials/stallion.html
 
 trainer.fit(tft, train_loader, val_loader)
 
