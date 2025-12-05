@@ -19,6 +19,8 @@ import pytorch_forecasting as pf
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
 
+from sklearn.metrics import mean_absolute_error
+
 # ---- debug probe (optional, for version checks) ----
 print("PF ver :", pf.__version__)
 print("PL ver :", pl.__version__)
@@ -34,12 +36,11 @@ tickers = [
     "META", "NVDA", "JPM", "V", "JNJ"
 ]
 
-# You can silence the FutureWarning by setting auto_adjust explicitly
 prices = yf.download(
     tickers,
     start="2018-01-01",
     end="2024-01-01",
-    auto_adjust=True,  # or False, but keep it consistent
+    auto_adjust=True,
 )["Close"]
 
 # Convert MultiIndex columns -> tidy dataframe: [date, ticker, price]
@@ -64,7 +65,7 @@ def add_quantamental(dF: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.rolling(14).mean() / x.rolling(14).std()
     )
 
-    # placeholder "fundamentals" (you should replace with real fundamentals later)
+    # placeholder "fundamentals"
     dF["pe"] = np.random.lognormal(2.2, 0.3, len(dF))
     dF["roe"] = np.random.normal(0.15, 0.05, len(dF))
 
@@ -95,18 +96,10 @@ static_cats = ["ticker"]
 time_varying_known_reals = ["day", "usd"]
 time_varying_unknown_reals = ["price", "rsi", "pe", "roe", "ret"]
 
-# (Optional) add more technical indicators here, e.g.:
-# df["ret_5d"] = df.groupby("ticker")["ret"].transform(lambda x: x.rolling(5).sum())
-# df["vol_10d"] = df.groupby("ticker")["ret"].transform(lambda x: x.rolling(10).std())
-# time_varying_unknown_reals += ["ret_5d", "vol_10d"]
-
 
 # =========================================
 # 5. SCALE FEATURES (BUT **NOT** TARGET)
 # =========================================
-# We let GroupNormalizer handle target per ticker.
-# Only scale feature columns to avoid double-normalization.
-
 feature_cols = time_varying_known_reals + time_varying_unknown_reals
 scalers = {col: StandardScaler() for col in feature_cols}
 
@@ -117,19 +110,40 @@ print("Feature scaling done for:", feature_cols)
 
 
 # =========================================
-# 6. BUILD TimeSeriesDataSet (TRAIN & VAL)
+# 6. CREATE 70% / 15% / 15% SPLIT BY TIME
+# =========================================
+# dùng unique time_idx để chia theo thời gian, không shuffle
+time_indices = np.sort(df["time_idx"].unique())
+n_time = len(time_indices)
+
+train_end_idx = time_indices[int(0.7 * n_time) - 1]   # mốc kết thúc train
+val_end_idx   = time_indices[int(0.85 * n_time) - 1]  # mốc kết thúc val
+
+train_df = df[df.time_idx <= train_end_idx].copy()
+val_df   = df[(df.time_idx > train_end_idx) & (df.time_idx <= val_end_idx)].copy()
+test_df  = df[df.time_idx > val_end_idx].copy()
+
+print("Train period :",
+      train_df["date"].min().date(), "->", train_df["date"].max().date())
+print("Val period   :",
+      val_df["date"].min().date(), "->", val_df["date"].max().date())
+print("Test period  :",
+      test_df["date"].min().date(), "->", test_df["date"].max().date())
+
+print("Train rows:", len(train_df))
+print("Val rows  :", len(val_df))
+print("Test rows :", len(test_df))
+
+
+# =========================================
+# 7. BUILD TimeSeriesDataSet (TRAIN / VAL / TEST)
 # =========================================
 max_encoder_len = 60   # look-back window
 max_prediction_len = 1 # 1-step ahead forecast
 
-# Better temporal split: ~90% train, 10% validation
-training_cutoff = int(df["time_idx"].quantile(0.9))
-print("Training cutoff time_idx:", training_cutoff)
-
-training_df = df[df.time_idx <= training_cutoff].copy()
-
-dataset = TimeSeriesDataSet(
-    training_df,
+# 7.1 training dataset
+training = TimeSeriesDataSet(
+    train_df,
     time_idx="time_idx",
     target="target",
     group_ids=["ticker"],
@@ -143,7 +157,6 @@ dataset = TimeSeriesDataSet(
     time_varying_known_reals=time_varying_known_reals,
     time_varying_unknown_reals=time_varying_unknown_reals,
 
-    # IMPORTANT: single normalizer for target (no external scaling)
     target_normalizer=GroupNormalizer(groups=["ticker"]),
 
     add_relative_time_idx=True,
@@ -152,45 +165,58 @@ dataset = TimeSeriesDataSet(
     add_encoder_length=True,
 )
 
-# Validation dataset from full df (pytorch_forecasting infers which parts to predict)
-val_dataset = TimeSeriesDataSet.from_dataset(
-    dataset,
-    df,
-    predict=True,
+# 7.2 validation & test reuse cấu hình từ training
+validation = TimeSeriesDataSet.from_dataset(
+    training,
+    val_df,
+    predict=False,
     stop_randomization=True,
 )
 
-train_loader = dataset.to_dataloader(
+test = TimeSeriesDataSet.from_dataset(
+    training,
+    test_df,
+    predict=False,
+    stop_randomization=True,
+)
+
+train_loader = training.to_dataloader(
     batch_size=128,
     shuffle=True,
-    num_workers=0  # keep 0 on Windows to avoid issues
+    num_workers=0
 )
-val_loader = val_dataset.to_dataloader(
+val_loader = validation.to_dataloader(
+    batch_size=256,
+    shuffle=False,
+    num_workers=0
+)
+test_loader = test.to_dataloader(
     batch_size=256,
     shuffle=False,
     num_workers=0
 )
 
-print(f"Number of training samples: {len(dataset)}")
-print(f"Number of validation samples: {len(val_dataset)}")
+print(f"Number of training samples  : {len(training)}")
+print(f"Number of validation samples: {len(validation)}")
+print(f"Number of test samples      : {len(test)}")
 
 
 # =========================================
-# 7. TRAINER WITH EARLY STOPPING
+# 8. TRAINER WITH EARLY STOPPING
 # =========================================
 pl.seed_everything(42, workers=True)
 
 early_stop_cb = EarlyStopping(
-    monitor="val_loss",  # metric logged by TFT
+    monitor="val_loss",
     patience=5,
     mode="min"
 )
 
 trainer = pl.Trainer(
     accelerator="gpu" if torch.cuda.is_available() else "cpu",
-    max_epochs=1 0,                # more than 1 epoch now
+    max_epochs=30,               # bạn có thể chỉnh tùy ý
     gradient_clip_val=0.1,
-    logger=False,                 # no logger, so no LR monitor
+    logger=False,
     enable_progress_bar=True,
     callbacks=[early_stop_cb],
     log_every_n_steps=10,
@@ -198,50 +224,68 @@ trainer = pl.Trainer(
 
 
 # =========================================
-# 8. BUILD TFT MODEL (UPGRADED CONFIG)
+# 9. BUILD TFT MODEL
 # =========================================
 tft = TemporalFusionTransformer.from_dataset(
-    dataset,
-    learning_rate=3e-4,          # lower LR for stability
-    hidden_size=128,             # larger model
+    training,
+    learning_rate=3e-4,
+    hidden_size=128,
     attention_head_size=4,
-    dropout=0.2,                 # a bit more regularization
+    dropout=0.2,
     reduce_on_plateau_patience=3,
-    # loss = pf.metrics.MAE(),   # You can switch to MAE or QuantileLoss if desired
 )
 
 print(f"Number of parameters in network: {tft.size()/1e3:.1f}k")
 
 
 # =========================================
-# 9. TRAIN MODEL
+# 10. TRAIN MODEL
 # =========================================
 trainer.fit(tft, train_loader, val_loader)
 print("Training finished.")
 
-# Best validation loss seen during training (from EarlyStopping callback)
 best_val_loss = early_stop_cb.best_score.item()
-print(f"[UPGRADED MODEL] Best val_loss: {best_val_loss:.6f}")
+print(f"[MODEL] Best val_loss : {best_val_loss:.6f}")
 
-# Validation loss in the last epoch
 final_val_loss = trainer.callback_metrics["val_loss"].item()
-print(f"[UPGRADED MODEL] Final epoch val_loss: {final_val_loss:.6f}")
+print(f"[MODEL] Final val_loss: {final_val_loss:.6f}")
 
 
 # =========================================
-# 10. PREDICTION & INTERPRETATION
+# 11. EVALUATE ON TEST SET
 # =========================================
-# mode="raw" returns raw network output (for interpretability)
+tft.to("cpu")  # đảm bảo inference trên CPU
+
+# collect predictions & ground truth
+y_true_list = []
+y_pred_list = []
+
+with torch.no_grad():
+    for x, y in iter(test_loader):
+        # y: (batch, max_prediction_len)
+        y_true_list.append(y[:, 0].cpu())
+        pred = tft(x.to("cpu")).squeeze(-1)  # output: (batch, 1) -> (batch,)
+        y_pred_list.append(pred[:, 0].cpu())
+
+y_true = torch.cat(y_true_list).numpy()
+y_pred = torch.cat(y_pred_list).numpy()
+
+test_mae = mean_absolute_error(y_true, y_pred)
+print(f"[MODEL] Test MAE on target (next-day log-return): {test_mae:.6f}")
+
+
+# =========================================
+# 12. PREDICTION & INTERPRETATION (OPTIONAL, USING TEST SET)
+# =========================================
 predictions = tft.predict(
-    val_loader,
+    test_loader,
     mode="raw",
     return_x=True,
-    trainer_kwargs={"accelerator": "cpu"}  # CPU is fine for inference
+    trainer_kwargs={"accelerator": "cpu"},
 )
 
 interpretation = tft.interpret_output(predictions.output, reduction="sum")
 
-# Plot variable importances, attention, etc.
 tft.plot_interpretation(interpretation)
 plt.tight_layout()
 plt.show()
